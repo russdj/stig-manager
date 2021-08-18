@@ -1,11 +1,14 @@
 'use strict';
 
+const packageJson = require("./package.json")
+console.log(`Starting STIG Manager ${packageJson.version}`)
+
+const config = require('./utils/config')
 const path = require('path')
 const http = require('http')
 const express = require('express')
 const cors = require('cors');
 const morgan = require('morgan')
-const config = require('./utils/config')
 const auth = require('./utils/auth')
 const swaggerUi = require('swagger-ui-express')
 const jsyaml = require('js-yaml');
@@ -20,8 +23,6 @@ const {
   resolvers,
 } = require('express-openapi-validator');
 
-
-console.log(`Starting STIG Manager ${config.version}`)
 
 //Catch unhandled errors. 
 process.on('uncaughtException', (err, origin) => {
@@ -60,36 +61,17 @@ app.use(morgan(':remote-addr :forwarded-for :token-user [:date[clf]] ":method :u
 // compress all responses
 // app.use(compression())
 
-// OpenAPI specification
-//let spec = fs.readFileSync(path.join(__dirname,'api/openapi.yaml'), 'utf8')
-let spec = fs.readFileSync(path.join(__dirname,'./specification/stig-manager.yaml'), 'utf8')
-let oasDoc = jsyaml.safeLoad(spec)
-oasDoc.info.version = config.version
-
-// Replace host with config values
-oasDoc.servers[0].url = config.swaggerUi.server
-oasDoc.components.securitySchemes.oauth.flows.implicit.authorizationUrl = `${config.swaggerUi.authority}/protocol/openid-connect/auth`
-
-const apiSpecPath = path.join(__dirname, './specification/stig-manager.yaml');
-
 //  2. Install the OpenApiValidator middleware
+const apiSpecPath = path.join(__dirname, './specification/stig-manager.yaml');
+let responseValidationConfig = buildResponseValidationConfig();
 app.use(
   openApiMiddleware({
     apiSpec: apiSpecPath,
     validateRequests: {
       coerceTypes: true,
       allowUnknownQueryParameters: false,
-    },    // validateResponses: true, // default false
-    // validateResponses: {
-    //   removeAdditional: 'failing',
-    // },
-    // validateResponses: {
-    //   onError: (error, body, req) => {
-    //     console.log(`Response body fails validation: `, error);
-    //     console.log(`Emitted from:`, req.originalUrl);
-    //     console.debug(body);
-    //   }
-    // },
+    },
+    validateResponses: responseValidationConfig,
     validateApiSpec: true,
     $refParser: {
       mode: 'dereference',
@@ -107,13 +89,6 @@ app.use(
       }
     },
     fileUploader: false
-    //   fileUploader: { 
-    //     storage: storage,
-    //   limits: {
-    //     fileSize: parseInt(config.http.maxUpload),
-    //     files: 1
-    //   }
-    //  }
   }),
 );
 
@@ -121,12 +96,6 @@ app.use(
 app.use((err, req, res, next) => {
   // 7. Customize errors
   console.error(err); // dump error to console for debug
-  // res.status(err.status || 500).json({
-  //   message: err.message,
-  //   errors: err.errors,
-  //   code: err.code
-  // });
-  //Perhaps only return the whole error object when in a "Dev" mode?
   res.status(err.status || 500).json(err);
 });
 
@@ -145,12 +114,22 @@ async function run() {
       console.log('[CLIENT] Client is disabled')
     }
     if (config.swaggerUi.enabled) {
+      // Read and modify OpenAPI specification
+      let spec = fs.readFileSync(path.join(__dirname,'./specification/stig-manager.yaml'), 'utf8')
+      let oasDoc = jsyaml.safeLoad(spec)
+      // Replace with config values
+      oasDoc.info.version = config.version
+      oasDoc.servers[0].url = config.swaggerUi.server
+      oasDoc.components.securitySchemes.oauth.openIdConnectUrl = `${config.client.authority}/.well-known/openid-configuration`
+      
       app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(oasDoc, null, {
-        oauth2RedirectUrl: config.swaggerUi.oauth2RedirectUrl
+        oauth2RedirectUrl: config.swaggerUi.oauth2RedirectUrl,
+        oauth: {
+          usePkceWithAuthorizationCodeGrant: true
+        }
       }))
-      app.get('/swagger.json', function(req, res) {
-          res.setHeader('Content-Type', 'application/json');
-          res.send(oasDoc);
+      app.get(['/swagger.json','/openapi.json'], function(req, res) {
+        res.json(oasDoc);
       })
     }
     startServer(app)
@@ -165,59 +144,42 @@ async function run() {
 async function setupClient(app, directory) {
   try {
     console.log(`[CLIENT] Setting up STIG Manager client...`)
-    let options = {
-      all: false,
-      diff: false,
-      protect: false,
-      syntax: 'default',
-      system: true
-    }   
     const envJS = 
 `
-Ext.ns('STIGMAN')
-
-STIGMAN.Env = {
+const STIGMAN = {
+  Env: {
     version: "${config.version}",
-    apiBase: "${process.env.STIGMAN_CLIENT_API_BASE ?? '/api'}",
+    apiBase: "${config.client.apiBase}",
     commit: {
-        branch: "${process.env.COMMIT_BRANCH ?? 'na'}",
-        sha: "${process.env.COMMIT_SHA ?? 'na'}",
-        tag: "${process.env.COMMIT_TAG ?? 'na'}",
-        describe: "${process.env.COMMIT_DESCRIBE ?? 'na'}"
+        branch: "${config.commit.branch}",
+        sha: "${config.commit.sha}",
+        tag: "${config.commit.tag}",
+        describe: "${config.commit.describe}"
     },
     oauth: {
+        authority:  "${config.client.authority}",
+        clientId: "${config.client.clientId}",
+        refreshToken: {
+          disabled: ${config.client.refreshToken.disabled}
+        },
+        extraScopes: "${config.client.extraScopes ?? ''}",
         claims: {
-            username: "${config.oauth.claims.username}",
-            servicename: "${config.oauth.claims.servicename}",
-            name: "${config.oauth.claims.name}}",
-            roles: "${config.oauth.claims.roles}",
-            email: "${config.oauth.claims.email}"
+          scope: "${config.oauth.claims.scope}",
+          scopeFormat: "${config.oauth.claims.scopeFormat}",
+          username: "${config.oauth.claims.username}",
+          servicename: "${config.oauth.claims.servicename}",
+          name: "${config.oauth.claims.name}",
+          privileges: "${config.oauth.claims.privileges}",
+          email: "${config.oauth.claims.email}"
         }
     }
+  }
 }    
 `
-
-    const keycloakJson = 
-`
-{
-  "realm": "${process.env.STIGMAN_CLIENT_KEYCLOAK_REALM ?? 'stigman'}",
-  "auth-server-url": "${process.env.STIGMAN_CLIENT_KEYCLOAK_AUTH ?? 'http://localhost:8080/auth'}",
-  "ssl-required": "external",
-  "resource": "${process.env.STIGMAN_CLIENT_KEYCLOAK_CLIENTID ?? 'stig-manager'}",
-  "public-client": true,
-  "confidential-port": 0
-}    
-`
-
     app.get('/js/Env.js', function (req, res) {
       writer.writeWithContentType(res, {payload: envJS, contentType: "application/javascript"})
     })
-    app.get('/js/keycloak.json', function (req, res) {
-      writer.writeWithContentType(res, {payload: keycloakJson, contentType: "application/json"})
-    })
-
     app.use('/', express.static(path.join(__dirname, directory)))
-
   }
   catch (err) {
     console.error(err.message)
@@ -284,4 +246,20 @@ function modulePathResolver(
     );
   }
   return handler[method];
+}
+
+function buildResponseValidationConfig(){
+  if ( config.settings.responseValidation == "logOnly" ){
+    return {
+        onError: (error, body, req) => {
+          console.log(`Response body fails validation: `, error);
+          console.log(`Response body emitted from:`, req.originalUrl);
+          console.debug(`Response body:`, body);
+        }
+      }
+  }
+  else {
+    return false
+  }
+
 }

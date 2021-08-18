@@ -310,7 +310,7 @@ exports.queryUsersByAssetStig = async function (inPredicates = {}, elevate = fal
   }
 }
 
-exports.addOrUpdateAsset = async function (writeAction, assetId, body, projection, elevate, userObject) {
+exports.addOrUpdateAsset = async function (writeAction, assetId, body, projection, transferring, userObject) {
   let connection
   try {
     // CREATE: assetId will be null
@@ -357,6 +357,14 @@ exports.addOrUpdateAsset = async function (writeAction, assetId, body, projectio
             WHERE
               assetId = ?`
         await connection.query(sqlUpdate, [assetFields, assetId])
+        if (transferring) {
+          let sqlDeleteRestrictedUsers = 
+            `DELETE user_stig_asset_map
+            FROM user_stig_asset_map
+            INNER JOIN stig_asset_map USING (saId)
+            WHERE stig_asset_map.assetId = ?`
+          await connection.query(sqlDeleteRestrictedUsers, [assetId])
+        }
       }
     }
     else {
@@ -409,7 +417,7 @@ exports.addOrUpdateAsset = async function (writeAction, assetId, body, projectio
 
   // Fetch the new or updated Asset for the response
   try {
-    let row = await _this.getAsset(assetId, projection, elevate, userObject)
+    let row = await _this.getAsset(assetId, projection, false, userObject)
     return row
   }
   catch (err) {
@@ -1139,9 +1147,9 @@ exports.attachAssetsToStig = async function(collectionId, benchmarkId, assetIds,
  * assetId Integer A path parameter that indentifies an Asset
  * returns AssetDetail
  **/
-exports.updateAsset = async function( assetId, body, projection, elevate, userObject ) {
+exports.updateAsset = async function( assetId, body, projection, transferring, userObject ) {
   try {
-    let row = await _this.addOrUpdateAsset(dbUtils.WRITE_ACTION.UPDATE, assetId, body, projection, elevate, userObject)
+    let row = await _this.addOrUpdateAsset(dbUtils.WRITE_ACTION.UPDATE, assetId, body, projection, transferring, userObject)
     return (row)
   } 
   catch (err) {
@@ -1149,20 +1157,103 @@ exports.updateAsset = async function( assetId, body, projection, elevate, userOb
   }
 }
 
-/**
- * Replace an Asset
- *
- * body Asset
- * projection
- * assetId Integer A path parameter that indentifies an Asset
- * returns AssetDetail
- **/
-exports.replaceAsset = async function( assetId, body, projection, elevate, userObject ) {
-  try {
-    let row = await _this.addOrUpdateAsset(dbUtils.WRITE_ACTION.REPLACE, assetId, body, projection, elevate, userObject)
-    return (row)
-  } 
-  catch (err) {
-    throw ( {status: 500, message: err.message, stack: err.stack} )
-  }
+
+
+
+exports.getAssetMetadataKeys = async function ( assetId ) {
+  const binds = []
+  let sql = `
+    select
+      JSON_KEYS(metadata) as keyArray
+    from 
+      asset
+    where 
+      assetId = ?`
+  binds.push(assetId)
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return rows.length > 0 ? rows[0].keyArray : []
+}
+
+exports.getAssetMetadata = async function ( assetId ) {
+  const binds = []
+  let sql = `
+    select
+      metadata 
+    from 
+      asset
+    where 
+      assetId = ?`
+  binds.push(assetId)
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return rows.length > 0 ? rows[0].metadata : {}
+}
+
+exports.patchAssetMetadata = async function ( assetId, metadata ) {
+  const binds = []
+  let sql = `
+    update
+      asset 
+    set 
+      metadata = JSON_MERGE_PATCH(metadata, ?)
+    where 
+      assetId = ?`
+  binds.push(JSON.stringify(metadata), assetId)
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return true
+}
+
+exports.putAssetMetadata = async function ( assetId, metadata ) {
+  const binds = []
+  let sql = `
+    update
+      asset
+    set 
+      metadata = ?
+    where 
+      assetId = ?`
+  binds.push(JSON.stringify(metadata), assetId)
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return true
+}
+
+exports.getAssetMetadataValue = async function ( assetId, key ) {
+  const binds = []
+  let sql = `
+    select
+      JSON_EXTRACT(metadata, ?) as value
+    from 
+      asset
+    where 
+      assetId = ?`
+  binds.push(`$."${key}"`, assetId)
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return rows.length > 0 ? rows[0].value : ""
+}
+
+exports.putAssetMetadataValue = async function ( assetId, key, value ) {
+  const binds = []
+  let sql = `
+    update
+      asset
+    set 
+      metadata = JSON_SET(metadata, ?, ?)
+    where 
+      assetId = ?`
+  binds.push(`$."${key}"`, value, assetId)
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return rows.length > 0 ? rows[0].value : ""
+}
+
+exports.deleteAssetMetadataKey = async function ( assetId, key ) {
+  const binds = []
+  let sql = `
+    update
+      asset
+    set 
+      metadata = JSON_REMOVE(metadata, ?)
+    where 
+      assetId = ?`
+  binds.push(`$."${key}"`, assetId)
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return rows.length > 0 ? rows[0].value : ""
 }

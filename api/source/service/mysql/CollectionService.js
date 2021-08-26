@@ -1080,3 +1080,311 @@ exports.deleteCollectionMetadataKey = async function ( collectionId, key ) {
   let [rows] = await dbUtils.pool.query(sql, binds)
   return rows.length > 0 ? rows[0].value : ""
 }
+
+
+/*
+Available only to level 3 or 4 users ("Manage" or "Owner")
+Returns number of history entries deleted.
+RetentionDate - Delete all review history entries prior to the specified date.
+Asset Id - if provided, only delete entries for that asset.
+*/
+exports.deleteReviewHistoryByCollection = async function (collectionId, retentionDate, assetId) {
+  let sql = `
+    DELETE rh 
+    FROM revision_history rh 
+      INNER JOIN review r on rh.reviewId = r.reviewId
+      INNER JOIN JOIN asset a on r.assetId = a.assetId
+    WHERE rh.ts < :retentionDate
+      AND a.collectionId = :collectionId`
+
+  if(assetId) {
+    sql += ' AND a.assetId = :assetId'
+  }
+
+  let binds = {
+    retentionDate: retentionDate,
+    collectionId: collectionId,
+    assetId: assetId
+  }  
+
+/*
+  HistoryEntriesDeleted: 
+  type: integer   
+  */
+  let [rows] = await dbUtils.pool.query(sql, binds)
+  return (rows[0])
+}
+
+/*
+GET /collections/{collectionId}/review-history
+Available to all users with a grant to the collection. For level 1 users, only entries that fall under their Asset-STIG grants should be returned.
+Returns block of review history entries that fit criteria. Takes optional:
+Start Date
+End Date
+(If no dates provided, return all history. If only one date, return block from that date to current, or that date to oldest, as appropriate)
+Asset ID - only return history for this asset id
+Rule ID - only return history for this rule id
+status- only return history with this status
+If rule and asset id provided, return that intersection.
+*/
+exports.getReviewHistoryByCollection = async function (collectionId, startDate, endDate, assetId, ruleId, status, userObject) {
+  const level1User = userObject.collectionGrants.find( g => g.collection.collectionId === collectionId && g.collection.lvl1User)
+
+  let binds = {
+    collectionId: collectionId
+  }
+  
+  let sql = `
+    SELECT a.assetId, 
+      (select coalesce(
+        (select json_arrayagg(
+          json_object
+            (
+            'ruleId', rv.ruleId,
+            'ts', rh.ts, 
+            'resultId', rh.resultId,
+            'resultComment', rh.resultComment,
+            'actionId', rh.actionId,
+            'actionComment', rh.actionComment,
+            'autoResult', rh.autoResult = 1,
+            'statusId', rh.statusId,
+            'userId', rh.userId,
+            'username', ud.username,
+            'rejectText', rh.rejectText,
+            'rejectUserId', rh.rejectUserId
+            )
+          )
+          FROM review_history rh
+            INNER JOIN review rv on rh.reviewId = rv.reviewId
+            INNER JOIN user_data ud on rh.userId = ud.userId
+          WHERE rv.assetId = a.assetId`
+
+  if (startDate) {
+    binds.startDate = startDate
+    sql += " AND rh.ts >= :startDate"
+  }
+
+  if (endDate) {
+    binds.endDate = endDate
+    sql += " AND rh.ts <= :endDate"
+  }
+
+  if(ruleId) {
+    binds.ruleId = ruleId
+    sql += " AND rv.ruleId = :ruleId"
+  }
+
+  if(status) {
+    binds.statusId = dbUtils.REVIEW_STATUS_API[status]
+    sql += ' AND rh.statusId = :statusId'
+  }
+  
+  sql += `
+          ), json_array()
+        )
+      ) as history
+    FROM asset a
+    WHERE a.collectionId = :collectionId
+  `
+
+  if(assetId) {
+    binds.assetId = assetId
+    sql += " AND a.assetId = :assetId"
+  }
+
+  if(level1User) {
+    binds.level1User = userObject.userId
+    sql += ` 
+      AND a.assetId IN (
+        SELECT sam.assetId
+        FROM stig_asset_map sam
+          INNER JOIN user_stig_asset_map usam ON sam.saId = usam.saId
+        WHERE usam.userId = :level1User
+      )
+    `
+  }
+
+
+  try {
+    let [rows] = await dbUtils.pool.query(sql, binds)
+    for(const row of rows) {
+      for(const history of row.history) {
+
+        //Translate the numeric values from the database back to text since we don't have lookup tables for these.
+        history.result = dbUtils.getKeyByValue(dbUtils.REVIEW_RESULT_API, history.resultId)
+        history.action = dbUtils.getKeyByValue(dbUtils.REVIEW_ACTION_API, history.actionId)
+        history.status = dbUtils.getKeyByValue(dbUtils.REVIEW_STATUS_API, history.statusId)
+  
+        // Remove the properties which have been translated to text.
+        delete history.resultId
+        delete history.actionId
+        delete history.statusId
+      }
+    }
+
+    return (rows)
+  }
+  catch(err) {
+    throw ( {status: 500, message: err.message, stack: err.stack} ) 
+  }
+}
+
+/*
+GET /collections/{collectionId}/review-history/stats
+Available to all users with a grant to the collection. For level 1 users, only entries that fall under their Asset-STIG grants should be returned.
+Return some simple stats about the number/properties of history entries.
+Uses same params as GET review-history, expecting stats to be scoped to whatever would be returned by that query.
+Projection: asset - Break out statistics by Asset in the specified collection
+*/
+exports.getReviewHistoryStatsByCollection = async function (collectionId, startDate, endDate, assetId, ruleId, status, projection, userObject) {
+  const level1User = userObject.collectionGrants.find( g => g.collection.collectionId === collectionId && g.collection.lvl1User)
+
+  let binds = {
+    collectionId: collectionId
+  }
+  
+
+/*
+    ReviewHistoryStats:
+      type: object
+      properties:
+        collectionHistoryEntryCount: 
+          type: integer
+        oldestHistoryEntryDate: 
+          type: string
+          nullable: true
+        assetHistoryEntryCounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewHistoryStatsAssetProjected'
+      required:
+        - collectionHistoryEntryCount
+        - oldestHistoryEntryDate
+
+    ReviewHistoryStatsAssetProjected:
+      type: object
+      properties:
+        assetId:
+          type: string
+        historyEntryCount:
+          type: integer
+        oldestHistoryEntry:
+          type: string
+          nullable: true
+        
+*/
+
+
+if (inProjection.includes('assets')) {
+  columns.push(`cast(
+    concat('[', 
+      coalesce (
+        group_concat(distinct 
+          case when a.assetId is not null then 
+            json_object(
+              'assetId', CAST(a.assetId as char), 
+              'name', a.name
+            )
+          else null end 
+        order by a.name),
+        ''),
+    ']')
+  as json) as "assets"`)
+}
+
+  let sql = `
+    SELECT a.assetId, 
+      (select coalesce(
+        (select json_arrayagg(
+          json_object
+            (
+            'ruleId', rv.ruleId,
+            'ts', rh.ts, 
+            'resultId', rh.resultId,
+            'resultComment', rh.resultComment,
+            'actionId', rh.actionId,
+            'actionComment', rh.actionComment,
+            'autoResult', rh.autoResult = 1,
+            'statusId', rh.statusId,
+            'userId', rh.userId,
+            'username', ud.username,
+            'rejectText', rh.rejectText,
+            'rejectUserId', rh.rejectUserId
+            )
+          )
+          FROM review_history rh
+            INNER JOIN review rv on rh.reviewId = rv.reviewId
+            INNER JOIN user_data ud on rh.userId = ud.userId
+          WHERE rv.assetId = a.assetId`
+
+  if (startDate) {
+    binds.startDate = startDate
+    sql += " AND rh.ts >= :startDate"
+  }
+
+  if (endDate) {
+    binds.endDate = endDate
+    sql += " AND rh.ts <= :endDate"
+  }
+
+  if(ruleId) {
+    binds.ruleId = ruleId
+    sql += " AND rv.ruleId = :ruleId"
+  }
+
+  if(status) {
+    binds.statusId = dbUtils.REVIEW_STATUS_API[status]
+    sql += ' AND rh.statusId = :statusId'
+  }
+  
+  sql += `
+          ), json_array()
+        )
+      ) as history
+    FROM asset a
+    WHERE a.collectionId = :collectionId
+  `
+
+  if(assetId) {
+    binds.assetId = assetId
+    sql += " AND a.assetId = :assetId"
+  }
+
+  if(level1User) {
+    binds.level1User = userObject.userId
+    sql += ` 
+      AND a.assetId IN (
+        SELECT sam.assetId
+        FROM stig_asset_map sam
+          INNER JOIN user_stig_asset_map usam ON sam.saId = usam.saId
+        WHERE usam.userId = :level1User
+      )
+    `
+  }
+
+
+  try {
+    let [rows] = await dbUtils.pool.query(sql, binds)
+    for(const row of rows) {
+      for(const history of row.history) {
+
+        //Translate the numeric values from the database back to text since we don't have lookup tables for these.
+        history.result = dbUtils.getKeyByValue(dbUtils.REVIEW_RESULT_API, history.resultId)
+        history.action = dbUtils.getKeyByValue(dbUtils.REVIEW_ACTION_API, history.actionId)
+        history.status = dbUtils.getKeyByValue(dbUtils.REVIEW_STATUS_API, history.statusId)
+  
+        // Remove the properties which have been translated to text.
+        delete history.resultId
+        delete history.actionId
+        delete history.statusId
+      }
+    }
+
+
+    return (rows)
+  }
+  catch(err) {
+    throw ( {status: 500, message: err.message, stack: err.stack} ) 
+  }
+
+}

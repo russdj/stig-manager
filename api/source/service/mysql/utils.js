@@ -409,6 +409,11 @@ module.exports.updateStatsAssetStig = async function(connection, { collectionId,
 module.exports.CONTEXT_ALL = 'all'
 module.exports.CONTEXT_DEPT = 'department'
 module.exports.CONTEXT_USER = 'user'
+
+// Needed to look up the property when retrieving the values from the database
+module.exports.getKeyByValue = (obj, value) => 
+        Object.keys(obj).find(key => obj[key] === value);
+
 module.exports.REVIEW_RESULT_API = { 
   'notchecked': 1,
   'notapplicable': 2,

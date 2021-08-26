@@ -1091,28 +1091,27 @@ Asset Id - if provided, only delete entries for that asset.
 exports.deleteReviewHistoryByCollection = async function (collectionId, retentionDate, assetId) {
   let sql = `
     DELETE rh 
-    FROM revision_history rh 
+    FROM review_history rh 
       INNER JOIN review r on rh.reviewId = r.reviewId
-      INNER JOIN JOIN asset a on r.assetId = a.assetId
-    WHERE rh.ts < :retentionDate
-      AND a.collectionId = :collectionId`
+      INNER JOIN asset a on r.assetId = a.assetId
+    WHERE a.collectionId = :collectionId
+      AND rh.ts < :retentionDate`
 
   if(assetId) {
     sql += ' AND a.assetId = :assetId'
   }
 
   let binds = {
-    retentionDate: retentionDate,
     collectionId: collectionId,
+    retentionDate: retentionDate,
     assetId: assetId
   }  
 
-/*
-  HistoryEntriesDeleted: 
-  type: integer   
-  */
   let [rows] = await dbUtils.pool.query(sql, binds)
-  return (rows[0])
+  let result = {
+    HistoryEntriesDeleted: rows.affectedRows
+  }
+  return (result)
 }
 
 /*
@@ -1242,117 +1241,70 @@ exports.getReviewHistoryStatsByCollection = async function (collectionId, startD
   let binds = {
     collectionId: collectionId
   }
-  
 
-/*
-    ReviewHistoryStats:
-      type: object
-      properties:
-        collectionHistoryEntryCount: 
-          type: integer
-        oldestHistoryEntryDate: 
-          type: string
-          nullable: true
-        assetHistoryEntryCounts:
-          type: array
-          items:
-            $ref: '#/components/schemas/ReviewHistoryStatsAssetProjected'
-      required:
-        - collectionHistoryEntryCount
-        - oldestHistoryEntryDate
+  let sql = 'SELECT COUNT(*) as collectionHistoryEntryCount, MIN(rh.ts) as oldestHistoryEntryDate'
 
-    ReviewHistoryStatsAssetProjected:
-      type: object
-      properties:
-        assetId:
-          type: string
-        historyEntryCount:
-          type: integer
-        oldestHistoryEntry:
-          type: string
-          nullable: true
-        
-*/
-
-
-if (inProjection.includes('assets')) {
-  columns.push(`cast(
-    concat('[', 
-      coalesce (
-        group_concat(distinct 
-          case when a.assetId is not null then 
-            json_object(
-              'assetId', CAST(a.assetId as char), 
-              'name', a.name
-            )
-          else null end 
-        order by a.name),
-        ''),
-    ']')
-  as json) as "assets"`)
-}
-
-  let sql = `
-    SELECT a.assetId, 
-      (select coalesce(
-        (select json_arrayagg(
-          json_object
-            (
-            'ruleId', rv.ruleId,
-            'ts', rh.ts, 
-            'resultId', rh.resultId,
-            'resultComment', rh.resultComment,
-            'actionId', rh.actionId,
-            'actionComment', rh.actionComment,
-            'autoResult', rh.autoResult = 1,
-            'statusId', rh.statusId,
-            'userId', rh.userId,
-            'username', ud.username,
-            'rejectText', rh.rejectText,
-            'rejectUserId', rh.rejectUserId
-            )
+  if (projection && projection.includes('asset')) {
+    sql += `, coalesce(
+      (SELECT json_arrayagg(
+        json_object(
+          'assetId', assetId,
+          'historyEntryCount', historyEntryCount,
+          'oldestHistoryEntry', oldestHistoryEntry
           )
+        )
+        FROM 
+        (
+          SELECT a.assetId, COUNT(*) as historyEntryCount, MIN(rh.ts) as oldestHistoryEntry
           FROM review_history rh
             INNER JOIN review rv on rh.reviewId = rv.reviewId
-            INNER JOIN user_data ud on rh.userId = ud.userId
-          WHERE rv.assetId = a.assetId`
+            INNER JOIN asset a on rv.assetId = a.assetId
+          WHERE a.collectionId = :collectionId
+          additionalPredicates
+          GROUP BY a.assetId
+        ) v
+      ), json_array()
+      ) as assetHistoryEntryCounts`
+  }
+
+  sql += `
+    FROM review_history rh
+      INNER JOIN review rv on rh.reviewId = rv.reviewId
+      INNER JOIN asset a on rv.assetId = a.assetId
+    WHERE a.collectionId = :collectionId
+    additionalPredicates
+  `
+
+  let additionalPredicates = ""
 
   if (startDate) {
     binds.startDate = startDate
-    sql += " AND rh.ts >= :startDate"
+    additionalPredicates += " AND rh.ts >= :startDate"
   }
 
   if (endDate) {
     binds.endDate = endDate
-    sql += " AND rh.ts <= :endDate"
+    additionalPredicates += " AND rh.ts <= :endDate"
   }
 
   if(ruleId) {
     binds.ruleId = ruleId
-    sql += " AND rv.ruleId = :ruleId"
+    additionalPredicates += " AND rv.ruleId = :ruleId"
   }
 
   if(status) {
     binds.statusId = dbUtils.REVIEW_STATUS_API[status]
-    sql += ' AND rh.statusId = :statusId'
+    additionalPredicates += ' AND rh.statusId = :statusId'
   }
   
-  sql += `
-          ), json_array()
-        )
-      ) as history
-    FROM asset a
-    WHERE a.collectionId = :collectionId
-  `
-
   if(assetId) {
     binds.assetId = assetId
-    sql += " AND a.assetId = :assetId"
+    additionalPredicates += " AND a.assetId = :assetId"
   }
 
   if(level1User) {
     binds.level1User = userObject.userId
-    sql += ` 
+    additionalPredicates += ` 
       AND a.assetId IN (
         SELECT sam.assetId
         FROM stig_asset_map sam
@@ -1362,26 +1314,12 @@ if (inProjection.includes('assets')) {
     `
   }
 
+  sql = sql.replace(/additionalPredicates/g, additionalPredicates)
+
 
   try {
     let [rows] = await dbUtils.pool.query(sql, binds)
-    for(const row of rows) {
-      for(const history of row.history) {
-
-        //Translate the numeric values from the database back to text since we don't have lookup tables for these.
-        history.result = dbUtils.getKeyByValue(dbUtils.REVIEW_RESULT_API, history.resultId)
-        history.action = dbUtils.getKeyByValue(dbUtils.REVIEW_ACTION_API, history.actionId)
-        history.status = dbUtils.getKeyByValue(dbUtils.REVIEW_STATUS_API, history.statusId)
-  
-        // Remove the properties which have been translated to text.
-        delete history.resultId
-        delete history.actionId
-        delete history.statusId
-      }
-    }
-
-
-    return (rows)
+    return (rows[0])
   }
   catch(err) {
     throw ( {status: 500, message: err.message, stack: err.stack} ) 

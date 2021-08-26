@@ -430,7 +430,7 @@ module.exports.deleteReviewHistoryByCollection = async function (req, res, next)
     const retentionDate = req.query.retentionDate
     const assetId = req.query.assetId
     let result = await Collection.deleteReviewHistoryByCollection(collectionId, retentionDate, assetId)
-    res.status(204).send()
+    res.json(result)
   }
   catch (err) {
     next(err)
